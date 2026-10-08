@@ -2,17 +2,9 @@ name: Release and Update Store
 
 on:
   push:
-    tags:
-      - "v*"
     branches:
       - main
       - master
-    paths:
-      - "store/**"
-      - "app.json"
-      - "app.config.js"
-      - "app.config.ts"
-      - "assets/**"
 
   workflow_dispatch:
 
@@ -22,14 +14,16 @@ permissions:
 env:
   APP_ID: debt-untangle
   APP_NAME: Debt Untangle
+  APP_VERSION: 1.0.${{ github.run_number }}
   APP_DESCRIPTION: Keep track of shared expenses and debts.
   APP_CATEGORY: Finance
   APP_REPOSITORY: https://github.com/zyrridian/debt-untangle
+  STORE_PAT: ${{ secrets.STORE_PAT }}
 
 jobs:
   release:
     name: Build, Release and Update Store
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -44,6 +38,26 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Set automatic app version
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))
+
+          node -e '
+            const fs = require("fs");
+            const path = "app.json";
+            const config = JSON.parse(fs.readFileSync(path, "utf8"));
+            config.expo.version = process.env.VERSION;
+            config.expo.android.versionCode = Number(process.env.VERSION_CODE);
+            fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          '
+
+          echo "Building app version $VERSION (Android versionCode $VERSION_CODE)"
+        env:
+          VERSION: ${{ env.APP_VERSION }}
+          VERSION_CODE: ${{ 1000 + github.run_number }}
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -117,8 +131,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: android/app/build/outputs/apk/release/app-release.apk
-          tag_name: ${{ github.ref_name }}
-          name: Debt Untangle ${{ github.ref_name }}
+          tag_name: v${{ env.APP_VERSION }}
+          name: Debt Untangle v${{ env.APP_VERSION }}
           draft: false
           prerelease: false
           generate_release_notes: true
@@ -126,6 +140,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout public app registry
+        if: env.STORE_PAT != ''
         uses: actions/checkout@v4
         with:
           repository: zyrridian/apps
@@ -133,15 +148,13 @@ jobs:
           path: storefront-repo
 
       - name: Copy release files and create manifest
+        if: env.STORE_PAT != ''
         working-directory: storefront-repo
         env:
-          VERSION: ${{ github.ref_name }}
-          RELEASE_URL: https://github.com/zyrridian/debt-untangle/releases/tag/${{ github.ref_name }}
+          RELEASE_URL: https://github.com/zyrridian/debt-untangle/releases/tag/v${{ env.APP_VERSION }}
           ICON_SOURCE: ${{ github.workspace }}/${{ steps.icon.outputs.path }}
         run: |
           set -euo pipefail
-
-          VERSION="${VERSION#v}"
 
           mkdir -p "apps/$APP_ID/screenshots"
 
@@ -172,7 +185,7 @@ jobs:
             --arg schema "v1" \
             --arg id "$APP_ID" \
             --arg name "$APP_NAME" \
-            --arg version "$VERSION" \
+            --arg version "$APP_VERSION" \
             --arg description "$APP_DESCRIPTION" \
             --arg category "$APP_CATEGORY" \
             --arg repository "$APP_REPOSITORY" \
@@ -202,6 +215,7 @@ jobs:
             }' > "apps/$APP_ID/manifest.json"
 
       - name: Generate normalized registry
+        if: env.STORE_PAT != ''
         working-directory: storefront-repo
         env:
           REGISTRY_GENERATED_AT: ${{ github.event.head_commit.timestamp }}
@@ -212,6 +226,7 @@ jobs:
             node scripts/generate-registry.mjs
 
       - name: Verify registry entry
+        if: env.STORE_PAT != ''
         working-directory: storefront-repo
         run: |
           set -euo pipefail
@@ -236,6 +251,7 @@ jobs:
             registry/apps.json > /dev/null
 
       - name: Commit and push registry update
+        if: env.STORE_PAT != ''
         working-directory: storefront-repo
         run: |
           set -euo pipefail
@@ -252,158 +268,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Auto-release: Debt Untangle ${{ github.ref_name }}"
-          git push
-
-  update-metadata:
-    name: Update Store Metadata
-    if: |
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
-      (contains(github.event.head_commit.message, '[skip store]') == false)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Run Expo prebuild
-        run: |
-          npm ci
-          npx expo prebuild --platform android --clean
-
-      - name: Find generated Android launcher icon
-        id: icon
-        run: |
-          set -euo pipefail
-
-          ICON=""
-
-          for candidate in \
-            android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp \
-            android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png \
-            android/app/src/main/res/mipmap-xxhdpi/ic_launcher.webp \
-            android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-          do
-            if [ -f "$candidate" ]; then
-              ICON="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$ICON" ]; then
-            echo "Generated Android launcher icon was not found"
-            exit 1
-          fi
-
-          echo "path=$ICON" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout public app registry
-        uses: actions/checkout@v4
-        with:
-          repository: zyrridian/apps
-          token: ${{ secrets.STORE_PAT }}
-          path: storefront-repo
-
-      - name: Copy metadata and icon
-        working-directory: storefront-repo
-        env:
-          ICON_SOURCE: ${{ github.workspace }}/${{ steps.icon.outputs.path }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p "apps/$APP_ID/screenshots"
-
-          cp "$ICON_SOURCE" \
-            "apps/$APP_ID/icon.webp"
-
-          if compgen -G "${{ github.workspace }}/store/screenshots/*" > /dev/null; then
-            cp "${{ github.workspace }}"/store/screenshots/* \
-              "apps/$APP_ID/screenshots/"
-          fi
-
-          VERSION="$(
-            jq -r --arg id "$APP_ID" \
-              '.apps[] | select(.id == $id) | .version' \
-              registry/apps.json
-          )"
-
-          RELEASE_URL="$(
-            jq -r --arg id "$APP_ID" \
-              '.apps[] | select(.id == $id) | .release' \
-              registry/apps.json
-          )"
-
-          SCREENSHOTS="$(
-            find "apps/$APP_ID/screenshots" \
-              -maxdepth 1 \
-              -type f \
-              -printf '%f\n' |
-              sort |
-              jq -R -s '
-                split("\n")
-                | map(select(length > 0))
-              '
-          )"
-
-          jq -n \
-            --arg schema "v1" \
-            --arg id "$APP_ID" \
-            --arg name "$APP_NAME" \
-            --arg version "$VERSION" \
-            --arg description "$APP_DESCRIPTION" \
-            --arg category "$APP_CATEGORY" \
-            --arg repository "$APP_REPOSITORY" \
-            --arg release "$RELEASE_URL" \
-            --arg icon "icon.webp" \
-            --arg artifact "app-release.apk" \
-            --argjson screenshots "$SCREENSHOTS" \
-            '{
-              schema: $schema,
-              id: $id,
-              name: $name,
-              version: $version,
-              description: $description,
-              category: $category,
-              repository: $repository,
-              release: $release,
-              featured: false,
-              icon: $icon,
-              artifacts: [
-                {
-                  platform: "android",
-                  type: "apk",
-                  filename: $artifact
-                }
-              ],
-              screenshots: $screenshots
-            }' > "apps/$APP_ID/manifest.json"
-
-      - name: Generate normalized registry
-        working-directory: storefront-repo
-        run: |
-          set -euo pipefail
-          node scripts/generate-registry.mjs
-
-      - name: Commit and push metadata update
-        working-directory: storefront-repo
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add \
-            "apps/$APP_ID" \
-            registry/apps.json
-
-          if git diff --cached --quiet; then
-            echo "No metadata changes to commit"
-            exit 0
-          fi
-
-          git commit -m "Auto-update: Debt Untangle metadata"
+          git commit -m "Auto-release: Debt Untangle v$APP_VERSION"
           git push
